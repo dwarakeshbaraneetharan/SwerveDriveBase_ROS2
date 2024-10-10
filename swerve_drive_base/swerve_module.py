@@ -5,29 +5,47 @@ from constants import ModuleConstants, DriveConstants
 from simple_pid import PID
 from math import pi
 import json
+import can
+import odrive
+from odrive.enums import AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_IDLE, CONTROL_MODE_VELOCITY_CONTROL, \
+    CONTROL_MODE_POSITION_CONTROL
+
 
 class SwerveModule(Node):
     def __init__(self, module_id):
         super().__init__('swerve_module_' + str(module_id))
         self.module_id = module_id
-        self.sub_state = self.create_subscription(String, 'module_' + str(module_id) + '/desired_state', self.state_callback, 10)
+        self.sub_state = self.create_subscription(String, 'module_' + str(module_id) + '/desired_state',
+                                                  self.state_callback, 10)
         self.timer = self.create_timer(0.1, self.timer_callback)
+
+        # Initialize motor states
         self.velocity = 0.0
         self.angle = 0.0
         self.drive_position = 0.0
         self.turning_position = 0.0
+
+        # Initialize PID controller for turning
         self.turning_pid_controller = PID(ModuleConstants.kPTurning, 0, 0, setpoint=0)
         self.turning_pid_controller.sample_time = 0.02
         self.turning_pid_controller.output_limits = (-pi, pi)
 
+        # Initialize ODrive interface
+        self.odrive = odrive.find_any()
+        self.drive_motor = self.odrive.axis0
+        self.turning_motor = self.odrive.axis1
+
+        self.drive_motor.requested_state = AXIS_STATE_CLOSED_LOOP_CONTROL
+        self.turning_motor.requested_state = AXIS_STATE_CLOSED_LOOP_CONTROL
+
     def timer_callback(self):
-        self.get_logger().info(f'Module {self.module_id}: Velocity: {self.velocity}, Angle: {self.angle}, Drive Position: {self.drive_position}, Turning Position: {self.turning_position}')
+        self.get_logger().info(
+            f'Module {self.module_id}: Velocity: {self.velocity}, Angle: {self.angle}, Drive Position: {self.drive_position}, Turning Position: {self.turning_position}')
 
     def state_callback(self, msg):
         try:
             state = json.loads(msg.data)
             self.set_desired_state(state['speed'], state['angle'])
-
         except json.JSONDecodeError as e:
             self.get_logger().error(f"Failed to parse state message: {e}")
 
@@ -37,32 +55,28 @@ class SwerveModule(Node):
             return
 
         optimized_angle = self.optimize_angle(angle)
-        # TODO: Add motor control logic
-        # Example: self.drive_motor.set(speed / DriveConstants.kPhysicalMaxSpeedMetersPerSecond)
 
+        # Motor control logic
+        self.drive_motor.controller.input_vel = speed / DriveConstants.kPhysicalMaxSpeedMetersPerSecond * ModuleConstants.kDriveEncoderRPM2MeterPerSec
         pid_output = self.turning_pid_controller(optimized_angle)
-        # TODO: Add motor control logic
-        # Example: self.turning_motor.set(pid_output)
+        self.turning_motor.controller.input_pos = pid_output
+
         self.get_logger().info(f'Swerve[{self.module_id}] state: speed={speed}, angle={optimized_angle}')
 
     def optimize_angle(self, desired_angle):
         current_angle = self.get_turning_position()
-        optimized_angle = desired_angle
-
+        desired_angle = self.normalize_angle(desired_angle)
         current_angle = self.normalize_angle(current_angle)
-        optimized_angle = self.normalize_angle(optimized_angle)
 
-        # Optimize based on minimizing angular displacement
-        angle_diff = optimized_angle - current_angle
+        angle_diff = desired_angle - current_angle
         if angle_diff > pi:
-            optimized_angle -= 2 * pi
+            desired_angle -= 2 * pi
         elif angle_diff < -pi:
-            optimized_angle += 2 * pi
+            desired_angle += 2 * pi
 
-        return optimized_angle
+        return desired_angle
 
     def normalize_angle(self, angle):
-        # Clamps to -pi, pi
         while angle > pi:
             angle -= 2 * pi
         while angle < -pi:
@@ -70,13 +84,15 @@ class SwerveModule(Node):
         return angle
 
     def get_drive_position(self):
-        return self.drive_position  # TODO: Implement encoder reading
+        return self.drive_motor.encoder.pos_estimate  # Encoder reading
 
     def get_turning_position(self):
-        return self.turning_position  # TODO: Implement encoder reading
+        return self.turning_motor.encoder.pos_estimate  # Encoder reading
 
     def stop(self):
-        return # TODO STOP motors here
+        self.drive_motor.requested_state = AXIS_STATE_IDLE
+        self.turning_motor.requested_state = AXIS_STATE_IDLE
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -84,6 +100,7 @@ def main(args=None):
     rclpy.spin(module)
     module.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
